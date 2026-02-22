@@ -827,7 +827,9 @@ fn normalize_entity_id(entity_id: &str) -> String {
 }
 
 fn normalize_tool_slug(action_name: &str) -> String {
-    action_name.trim().replace('_', "-").to_ascii_lowercase()
+    // The Composio v3 execute endpoint expects the original slug format (e.g. GMAIL_FETCH_EMAILS).
+    // Lowercasing or replacing underscores with hyphens causes 404s.
+    action_name.trim().to_string()
 }
 
 fn normalize_legacy_action_name(action_name: &str) -> String {
@@ -1306,10 +1308,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tool_slug_supports_legacy_action_name() {
+    fn normalize_tool_slug_preserves_original_format() {
+        // v3 execute endpoint requires the original slug format — must not lowercase or replace underscores
         assert_eq!(
             normalize_tool_slug("GMAIL_FETCH_EMAILS"),
-            "gmail-fetch-emails"
+            "GMAIL_FETCH_EMAILS"
         );
         assert_eq!(
             normalize_tool_slug(" github-list-repos "),
