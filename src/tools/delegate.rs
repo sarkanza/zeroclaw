@@ -281,7 +281,7 @@ impl Tool for DelegateTool {
                 .execute_agentic(
                     agent_name,
                     agent_config,
-                    &*provider,
+                    provider,
                     &full_prompt,
                     temperature,
                 )
@@ -344,7 +344,7 @@ impl DelegateTool {
         &self,
         agent_name: &str,
         agent_config: &DelegateAgentConfig,
-        provider: &dyn Provider,
+        provider: Box<dyn Provider>,
         full_prompt: &str,
         temperature: f64,
     ) -> anyhow::Result<ToolResult> {
@@ -390,12 +390,56 @@ impl DelegateTool {
         }
         history.push(ChatMessage::user(full_prompt.to_string()));
 
+        // Fire-and-forget: spawn sub-agent in background, return immediately.
+        // Salman can receive new messages while Ara/Volta is running.
+        if agent_config.fire_and_forget {
+            let provider_name = agent_config.provider.clone();
+            let model = agent_config.model.clone();
+            let multimodal_config = self.multimodal_config.clone();
+            let max_iterations = agent_config.max_iterations;
+            let agent_name_owned = agent_name.to_string();
+            // Move provider and sub_tools into the background task.
+            let provider_arc: Arc<dyn Provider> = Arc::from(provider);
+            let sub_tools_owned: Vec<Box<dyn Tool>> = sub_tools;
+            tokio::spawn(async move {
+                let noop_observer = NoopObserver;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
+                    run_tool_call_loop(
+                        provider_arc.as_ref(),
+                        &mut history,
+                        &sub_tools_owned,
+                        &noop_observer,
+                        &provider_name,
+                        &model,
+                        temperature,
+                        true,
+                        None,
+                        "delegate",
+                        &multimodal_config,
+                        max_iterations,
+                        None,
+                        None,
+                        None,
+                        &[],
+                    ),
+                )
+                .await;
+                tracing::debug!(agent = %agent_name_owned, "fire-and-forget sub-agent finished");
+            });
+            return Ok(ToolResult {
+                success: true,
+                output: format!("Agent '{agent_name}' started in background."),
+                error: None,
+            });
+        }
+
         let noop_observer = NoopObserver;
 
         let result = tokio::time::timeout(
             Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
             run_tool_call_loop(
-                provider,
+                &*provider,
                 &mut history,
                 &sub_tools,
                 &noop_observer,

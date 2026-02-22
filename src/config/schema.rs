@@ -238,6 +238,10 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Fire-and-forget: spawn sub-agent in background, return immediately.
+    /// Salman can receive and process new messages while Ara/Volta is running.
+    #[serde(default)]
+    pub fire_and_forget: bool,
 }
 
 fn default_max_depth() -> u32 {
