@@ -899,9 +899,16 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
+        // Block absolute paths when workspace_only is set,
+        // unless the path falls under an explicitly allowed root.
         if self.workspace_only && expanded_path.is_absolute() {
-            return false;
+            let under_allowed_root = self.allowed_roots.iter().any(|root| {
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                expanded_path.starts_with(&canonical)
+            });
+            if !under_allowed_root {
+                return false;
+            }
         }
 
         // Block forbidden paths using path-component-aware matching
