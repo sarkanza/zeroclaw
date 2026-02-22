@@ -991,22 +991,25 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     .next()
                     .map(|ext| TELEGRAM_TEXT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
                     .unwrap_or(false);
+                // Use relative path so file_read tool can access it without
+                // hitting the workspace_only absolute-path block.
+                let rel_path = format!("telegram_files/{local_filename}");
                 if is_text && file_data.len() <= TELEGRAM_MAX_INLINE_FILE_BYTES {
                     match std::str::from_utf8(&file_data) {
                         Ok(text) => format!(
                             "[Document: {}] (saved to {})\n\n```\n{}\n```",
                             local_filename,
-                            local_path.display(),
+                            rel_path,
                             text
                         ),
                         Err(_) => format!(
                             "[Document: {}] {}",
                             local_filename,
-                            local_path.display()
+                            rel_path
                         ),
                     }
                 } else {
-                    format!("[Document: {}] {}", local_filename, local_path.display())
+                    format!("[Document: {}] {}", local_filename, rel_path)
                 }
             }
             IncomingAttachmentKind::Photo => {

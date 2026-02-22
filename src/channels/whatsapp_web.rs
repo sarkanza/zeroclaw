@@ -334,22 +334,25 @@ impl Channel for WhatsAppWebChannel {
                                                 .next()
                                                 .map(|ext| WA_TEXT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
                                                 .unwrap_or(false);
+                                            // Use relative path so file_read can access it
+                                            // without hitting workspace_only absolute-path block.
+                                            let rel_path = format!("whatsapp_files/{file_name}");
                                             let mut content = if is_text && data.len() <= WA_MAX_INLINE_FILE_BYTES {
                                                 match std::str::from_utf8(&data) {
                                                     Ok(text) => format!(
                                                         "[Document: {}] (saved to {})\n\n```\n{}\n```",
                                                         file_name,
-                                                        local_path.display(),
+                                                        rel_path,
                                                         text
                                                     ),
                                                     Err(_) => format!(
                                                         "[Document: {}] {}",
                                                         file_name,
-                                                        local_path.display()
+                                                        rel_path
                                                     ),
                                                 }
                                             } else {
-                                                format!("[Document: {}] {}", file_name, local_path.display())
+                                                format!("[Document: {}] {}", file_name, rel_path)
                                             };
                                             if !caption.is_empty() {
                                                 content.push_str("\n\n");
