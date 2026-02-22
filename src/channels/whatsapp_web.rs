@@ -7,9 +7,10 @@
 //!
 //! # Feature Flag
 //!
-//! This channel requires the `whatsapp-web` feature flag:
+//! This channel is included in the default build. The `whatsapp-web` feature
+//! is enabled by default in `Cargo.toml`. No extra flags needed:
 //! ```sh
-//! cargo build --features whatsapp-web
+//! cargo build --release
 //! ```
 //!
 //! # Configuration
@@ -31,8 +32,21 @@ use super::whatsapp_storage::RusqliteStore;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::select;
+
+/// Maximum bytes of a text document to inline into the agent message
+const WA_MAX_INLINE_FILE_BYTES: usize = 128 * 1024; // 128 KB
+/// Maximum file size to attempt downloading (20 MB)
+const WA_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+/// File extensions treated as human-readable text that can be inlined
+const WA_TEXT_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "rst", "csv", "tsv", "json", "jsonl", "yaml", "yml", "toml",
+    "xml", "html", "htm", "css", "js", "ts", "py", "rs", "go", "java", "c", "cpp", "h",
+    "hpp", "sh", "bash", "zsh", "fish", "rb", "php", "swift", "kt", "scala", "r", "sql",
+    "graphql", "proto", "tf", "hcl", "ini", "cfg", "conf", "env", "log",
+];
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
@@ -64,6 +78,8 @@ pub struct WhatsAppWebChannel {
     client: Arc<Mutex<Option<Arc<wa_rs::Client>>>>,
     /// Message sender channel
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
+    /// Workspace directory for saving received files
+    workspace_dir: Option<PathBuf>,
 }
 
 impl WhatsAppWebChannel {
@@ -90,7 +106,15 @@ impl WhatsAppWebChannel {
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
+            workspace_dir: None,
         }
+    }
+
+    /// Set the workspace directory for saving received files.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_workspace_dir(mut self, workspace_dir: PathBuf) -> Self {
+        self.workspace_dir = Some(workspace_dir);
+        self
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
@@ -237,63 +261,208 @@ impl Channel for WhatsAppWebChannel {
         // Build the bot
         let tx_clone = tx.clone();
         let allowed_numbers = self.allowed_numbers.clone();
+        let workspace_dir = self.workspace_dir.clone();
 
         let mut builder = Bot::builder()
             .with_backend(backend)
             .with_transport_factory(transport_factory)
             .with_http_client(http_client)
-            .on_event(move |event, _client| {
+            .on_event(move |event, client| {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
+                let workspace_dir = workspace_dir.clone();
                 async move {
                     match event {
                         Event::Message(msg, info) => {
-                            // Extract message content
-                            let text = msg.text_content().unwrap_or("");
+                            use wa_rs::download::Downloadable;
+
                             let sender = info.source.sender.user().to_string();
                             let chat = info.source.chat.to_string();
 
-                            tracing::info!(
-                                "WhatsApp Web message from {} in {}: {}",
-                                sender,
-                                chat,
-                                text
-                            );
-
-                            // Check if sender is allowed
+                            // Normalize sender to E.164
                             let normalized = if sender.starts_with('+') {
                                 sender.clone()
                             } else {
                                 format!("+{sender}")
                             };
 
-                            if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
-                                let trimmed = text.trim();
-                                if trimmed.is_empty() {
-                                    tracing::debug!(
-                                        "WhatsApp Web: ignoring empty or non-text message from {}",
-                                        normalized
+                            if !allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
+                                tracing::warn!("WhatsApp Web: message from {} not in allowed list", normalized);
+                                return;
+                            }
+
+                            // Try text first
+                            let text = msg.text_content().unwrap_or("").trim().to_string();
+
+                            // Try document message
+                            let base = msg.get_base_message();
+                            if let Some(doc) = base.document_message.as_deref() {
+                                let file_name = doc.file_name.clone().unwrap_or_else(|| {
+                                    format!("document_{}", uuid::Uuid::new_v4())
+                                });
+                                let file_size = doc.file_length.unwrap_or(0);
+                                let caption = doc.caption.clone().unwrap_or_default();
+
+                                tracing::info!(
+                                    "WhatsApp Web: document '{}' ({} bytes) from {}",
+                                    file_name, file_size, normalized
+                                );
+
+                                if file_size > WA_MAX_FILE_DOWNLOAD_BYTES {
+                                    tracing::warn!(
+                                        "WhatsApp Web: skipping document '{}': {} bytes exceeds {} MB limit",
+                                        file_name, file_size, WA_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
                                     );
                                     return;
                                 }
 
-                                if let Err(e) = tx_inner
-                                    .send(ChannelMessage {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        channel: "whatsapp".to_string(),
-                                        sender: normalized.clone(),
-                                        // Reply to the originating chat JID (DM or group).
-                                        reply_target: chat,
-                                        content: trimmed.to_string(),
-                                        timestamp: chrono::Utc::now().timestamp() as u64,
-                                        thread_ts: None,
-                                    })
-                                    .await
-                                {
-                                    tracing::error!("Failed to send message to channel: {}", e);
+                                if let Some(ref workspace) = workspace_dir {
+                                    let save_dir = workspace.join("whatsapp_files");
+                                    if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+                                        tracing::warn!("WhatsApp Web: failed to create whatsapp_files dir: {e}");
+                                        return;
+                                    }
+                                    let local_path = save_dir.join(&file_name);
+                                    match client.download(doc).await {
+                                        Ok(data) => {
+                                            if let Err(e) = tokio::fs::write(&local_path, &data).await {
+                                                tracing::warn!("WhatsApp Web: failed to save '{}': {e}", file_name);
+                                                return;
+                                            }
+                                            let is_text = file_name
+                                                .rsplit('.')
+                                                .next()
+                                                .map(|ext| WA_TEXT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+                                                .unwrap_or(false);
+                                            let mut content = if is_text && data.len() <= WA_MAX_INLINE_FILE_BYTES {
+                                                match std::str::from_utf8(&data) {
+                                                    Ok(text) => format!(
+                                                        "[Document: {}] (saved to {})\n\n```\n{}\n```",
+                                                        file_name,
+                                                        local_path.display(),
+                                                        text
+                                                    ),
+                                                    Err(_) => format!(
+                                                        "[Document: {}] {}",
+                                                        file_name,
+                                                        local_path.display()
+                                                    ),
+                                                }
+                                            } else {
+                                                format!("[Document: {}] {}", file_name, local_path.display())
+                                            };
+                                            if !caption.is_empty() {
+                                                content.push_str("\n\n");
+                                                content.push_str(&caption);
+                                            }
+                                            if let Err(e) = tx_inner.send(ChannelMessage {
+                                                id: uuid::Uuid::new_v4().to_string(),
+                                                channel: "whatsapp".to_string(),
+                                                sender: normalized.clone(),
+                                                reply_target: chat,
+                                                content,
+                                                timestamp: chrono::Utc::now().timestamp() as u64,
+                                                thread_ts: None,
+                                            }).await {
+                                                tracing::error!("WhatsApp Web: failed to forward document: {e}");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("WhatsApp Web: failed to download document '{}': {e}", file_name);
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!("WhatsApp Web: workspace_dir not set, cannot save document '{}'", file_name);
                                 }
-                            } else {
-                                tracing::warn!("WhatsApp Web: message from {} not in allowed list", normalized);
+                                return;
+                            }
+
+                            // Try image message
+                            if let Some(img) = base.image_message.as_deref() {
+                                let file_size = img.file_length.unwrap_or(0);
+                                let caption = img.caption.clone().unwrap_or_default();
+
+                                tracing::info!(
+                                    "WhatsApp Web: image ({} bytes) from {}",
+                                    file_size, normalized
+                                );
+
+                                if file_size > WA_MAX_FILE_DOWNLOAD_BYTES {
+                                    tracing::warn!(
+                                        "WhatsApp Web: skipping image: {} bytes exceeds limit",
+                                        file_size
+                                    );
+                                    return;
+                                }
+
+                                if let Some(ref workspace) = workspace_dir {
+                                    let save_dir = workspace.join("whatsapp_files");
+                                    if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+                                        tracing::warn!("WhatsApp Web: failed to create whatsapp_files dir: {e}");
+                                        return;
+                                    }
+                                    let file_name = format!("image_{}.jpg", uuid::Uuid::new_v4());
+                                    let local_path = save_dir.join(&file_name);
+                                    match client.download(img).await {
+                                        Ok(data) => {
+                                            if let Err(e) = tokio::fs::write(&local_path, &data).await {
+                                                tracing::warn!("WhatsApp Web: failed to save image: {e}");
+                                                return;
+                                            }
+                                            let mut content = format!("[IMAGE:{}]", local_path.display());
+                                            if !caption.is_empty() {
+                                                content.push_str("\n\n");
+                                                content.push_str(&caption);
+                                            }
+                                            if let Err(e) = tx_inner.send(ChannelMessage {
+                                                id: uuid::Uuid::new_v4().to_string(),
+                                                channel: "whatsapp".to_string(),
+                                                sender: normalized.clone(),
+                                                reply_target: chat,
+                                                content,
+                                                timestamp: chrono::Utc::now().timestamp() as u64,
+                                                thread_ts: None,
+                                            }).await {
+                                                tracing::error!("WhatsApp Web: failed to forward image: {e}");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("WhatsApp Web: failed to download image: {e}");
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!("WhatsApp Web: workspace_dir not set, cannot save image");
+                                }
+                                return;
+                            }
+
+                            // Fall through to text
+                            if text.is_empty() {
+                                tracing::debug!(
+                                    "WhatsApp Web: ignoring empty or non-text message from {}",
+                                    normalized
+                                );
+                                return;
+                            }
+
+                            tracing::info!(
+                                "WhatsApp Web message from {} in {}: {}",
+                                normalized, chat, text
+                            );
+
+                            if let Err(e) = tx_inner
+                                .send(ChannelMessage {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    channel: "whatsapp".to_string(),
+                                    sender: normalized.clone(),
+                                    reply_target: chat,
+                                    content: text,
+                                    timestamp: chrono::Utc::now().timestamp() as u64,
+                                    thread_ts: None,
+                                })
+                                .await
+                            {
+                                tracing::error!("Failed to send message to channel: {}", e);
                             }
                         }
                         Event::Connected(_) => {

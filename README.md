@@ -554,9 +554,9 @@ ZeroClaw supports two WhatsApp backends:
 
 #### WhatsApp Web mode (recommended for personal/self-hosted use)
 
-1. **Build with WhatsApp Web support:**
+1. **Build ZeroClaw** (WhatsApp Web is included by default):
    ```bash
-   cargo build --features whatsapp-web
+   cargo build --release
    ```
 
 2. **Configure ZeroClaw:**
