@@ -13,6 +13,15 @@ use tokio::fs;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+/// Maximum bytes of a text document to inline into the agent message
+const TELEGRAM_MAX_INLINE_FILE_BYTES: usize = 128 * 1024; // 128 KB
+/// File extensions treated as human-readable text that can be inlined
+const TELEGRAM_TEXT_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "rst", "csv", "tsv", "json", "jsonl", "yaml", "yml", "toml",
+    "xml", "html", "htm", "css", "js", "ts", "py", "rs", "go", "java", "c", "cpp", "h",
+    "hpp", "sh", "bash", "zsh", "fish", "rb", "php", "swift", "kt", "scala", "r", "sql",
+    "graphql", "proto", "tf", "hcl", "ini", "cfg", "conf", "env", "log",
+];
 /// Reserve space for continuation markers added by send_text_chunks:
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
@@ -973,9 +982,32 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // Build message content.
         // Photos use [IMAGE:] marker so the multimodal pipeline validates
         // vision capability and rejects unsupported providers early.
+        // Text documents are inlined directly so the agent can read them
+        // without needing a file_read tool call.
         let mut content = match attachment.kind {
             IncomingAttachmentKind::Document => {
-                format!("[Document: {}] {}", local_filename, local_path.display())
+                let is_text = local_filename
+                    .rsplit('.')
+                    .next()
+                    .map(|ext| TELEGRAM_TEXT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+                    .unwrap_or(false);
+                if is_text && file_data.len() <= TELEGRAM_MAX_INLINE_FILE_BYTES {
+                    match std::str::from_utf8(&file_data) {
+                        Ok(text) => format!(
+                            "[Document: {}] (saved to {})\n\n```\n{}\n```",
+                            local_filename,
+                            local_path.display(),
+                            text
+                        ),
+                        Err(_) => format!(
+                            "[Document: {}] {}",
+                            local_filename,
+                            local_path.display()
+                        ),
+                    }
+                } else {
+                    format!("[Document: {}] {}", local_filename, local_path.display())
+                }
             }
             IncomingAttachmentKind::Photo => {
                 format!("[IMAGE:{}]", local_path.display())
